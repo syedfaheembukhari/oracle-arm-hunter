@@ -2,8 +2,8 @@ name: Oracle ARM Auto-Provisioner
 
 on:
   schedule:
-    # Runs at off-peak minutes (7 and 37 past every hour) to bypass GitHub queue delays
-    - cron: '7,37 * * * *'
+    # Triggers every 2 hours as a backup scheduler
+    - cron: '17 */2 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   hunt-capacity:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 360  # Max GitHub allowed limit (6 hours)
 
     steps:
       - name: Set up Python
@@ -63,7 +63,7 @@ jobs:
           SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.aaaaaaaae5l27ilikl2fkkls6p3pzz56igaz77jgnrowmrpmbrn6ieif4l4q"
           NAME="snookerops-prod"
 
-          # 1. Check if instance already exists
+          # 1. Verify if instance was already created
           EXISTING_STATE=$(oci compute instance list \
             --compartment-id "$COMPARTMENT" \
             --display-name "$NAME" \
@@ -79,7 +79,7 @@ jobs:
             exit 0
           fi
 
-          echo "🚀 Starting continuous capacity hunt loop (32 minutes per run)..."
+          echo "🚀 Starting 5-Hour Continuous Capacity Hunt in Hyderabad..."
           START_TIME=$(date +%s)
           ATTEMPT=0
 
@@ -88,14 +88,14 @@ jobs:
             NOW=$(date +%s)
             ELAPSED=$((NOW - START_TIME))
 
-            # Run for 32 minutes (~1920 seconds) then hand over cleanly to next cycle
-            if [ $ELAPSED -ge 1920 ]; then
-              echo "⏱️ 32-minute hunt cycle completed. Next scheduled cycle will take over."
+            # Run for 300 minutes (5 hours) continuously before cleanly passing to the next cycle
+            if [ $ELAPSED -ge 18000 ]; then
+              echo "⏱️ 5-Hour hunt session complete (300 mins). Ready for next cycle."
               exit 0
             fi
 
             TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-            echo "[$TIMESTAMP] Attempt #$ATTEMPT..."
+            echo "[$TIMESTAMP] Attempt #$ATTEMPT (Elapsed: $((ELAPSED / 60))m)..."
 
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT" \
