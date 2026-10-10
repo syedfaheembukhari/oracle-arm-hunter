@@ -2,19 +2,18 @@ name: Oracle ARM Auto-Provisioner
 
 on:
   schedule:
-    # Runs every 15 minutes 24/7 in the cloud
-    - cron: '*/15 * * * *'
-  # Allows manual one-click trigger from GitHub Actions tab anytime
+    # Runs at off-peak minutes (7 and 37 past every hour) to bypass GitHub queue delays
+    - cron: '7,37 * * * *'
   workflow_dispatch:
 
 concurrency:
-  group: oracle-arm-provisioner
+  group: oracle-arm-hunter
   cancel-in-progress: false
 
 jobs:
   hunt-capacity:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - name: Set up Python
@@ -54,18 +53,17 @@ jobs:
         env:
           SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
-          # Disable bash abort on command failure so capacity errors don't crash GitHub Action
           set +e
 
           TENANCY="ocid1.tenancy.oc1..aaaaaaaasp5nspa7btyxazrbxyikoy7dye64rdpn2m2e7ztb4uffag7iubia"
           COMPARTMENT="ocid1.tenancy.oc1..aaaaaaaasp5nspa7btyxazrbxyikoy7dye64rdpn2m2e7ztb4uffag7iubia"
           AD="WlOh:AP-HYDERABAD-1-AD-1"
-          SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.aaaaaaaae5l27ilikl2fkkls6p3pzz56igaz77jgnrowmrpmbrn6ieif4l4q"
-          IMAGE_ID="ocid1.image.oc1.ap-hyderabad-1.aaaaaaaacx5cw6qxwnemznb2wojrfdbkuepvgwzlwzqa2snxqslops3nmlua"
-          NAME="snookerops-prod"
           SHAPE="VM.Standard.A1.Flex"
+          IMAGE_ID="ocid1.image.oc1.ap-hyderabad-1.aaaaaaaacx5cw6qxwnemznb2wojrfdbkuepvgwzlwzqa2snxqslops3nmlua"
+          SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.aaaaaaaae5l27ilikl2fkkls6p3pzz56igaz77jgnrowmrpmbrn6ieif4l4q"
+          NAME="snookerops-prod"
 
-          echo "🔍 Checking if $NAME already exists and is active..."
+          # 1. Check if instance already exists
           EXISTING_STATE=$(oci compute instance list \
             --compartment-id "$COMPARTMENT" \
             --display-name "$NAME" \
@@ -81,7 +79,7 @@ jobs:
             exit 0
           fi
 
-          echo "🚀 Starting capacity hunt loop in Hyderabad..."
+          echo "🚀 Starting continuous capacity hunt loop (32 minutes per run)..."
           START_TIME=$(date +%s)
           ATTEMPT=0
 
@@ -90,10 +88,9 @@ jobs:
             NOW=$(date +%s)
             ELAPSED=$((NOW - START_TIME))
 
-            # Stop after 8.5 minutes so GitHub completes this cycle cleanly before next cron
-            if [ $ELAPSED -ge 510 ]; then
-              echo "⏱️ Hunt cycle completed (8.5 mins). Capacity not yet freed in Hyderabad."
-              echo "✅ Next automatic hunt will trigger in 15 minutes."
+            # Run for 32 minutes (~1920 seconds) then hand over cleanly to next cycle
+            if [ $ELAPSED -ge 1920 ]; then
+              echo "⏱️ 32-minute hunt cycle completed. Next scheduled cycle will take over."
               exit 0
             fi
 
@@ -114,8 +111,6 @@ jobs:
               --wait-for-state RUNNING \
               --max-wait-seconds 300 2>&1)
 
-            STATUS=$?
-
             if echo "$RESULT" | grep -q '"lifecycle-state": "RUNNING"'; then
               echo ""
               echo "🎉🎉🎉 SUCCESS! ARM INSTANCE PROVISIONED AND RUNNING! 🎉🎉🎉"
@@ -126,14 +121,14 @@ jobs:
               echo "Connect using: ssh -i ~/.ssh/oracle_snookerops_key ubuntu@$PUBLIC_IP"
               exit 0
             elif echo "$RESULT" | grep -qi "out of.*capacity\|out of host capacity\|InternalError\|LimitExceeded"; then
-              echo "   ⏳ Out of capacity in Hyderabad right now. Retrying in 40s..."
+              echo "   ⏳ Out of capacity in Hyderabad right now. Retrying in 45s..."
             elif echo "$RESULT" | grep -qi "TooManyRequests"; then
-              echo "   ⚠️ Rate limited. Waiting 90s..."
-              sleep 50
+              echo "   ⚠️ Rate limited by Oracle. Waiting 75s..."
+              sleep 45
             else
               echo "   ℹ️ OCI Output: $(echo "$RESULT" | grep -E '"message"|"code"' | head -4)"
-              echo "   Retrying in 40s..."
+              echo "   Retrying in 45s..."
             fi
 
-            sleep 40
+            sleep 45
           done
