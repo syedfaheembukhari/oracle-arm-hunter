@@ -101,12 +101,12 @@ jobs:
               --compartment-id "$COMPARTMENT" \
               --availability-domain "$AD" \
               --shape "$SHAPE" \
-              --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
+              --shape-config '{"ocpus": 1, "memoryInGBs": 6}' \
               --display-name "$NAME" \
               --image-id "$IMAGE_ID" \
               --subnet-id "$SUBNET_ID" \
               --assign-public-ip true \
-              --boot-volume-size-in-gbs 100 \
+              --boot-volume-size-in-gbs 50 \
               --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBLIC_KEY\"}" \
               --wait-for-state RUNNING \
               --max-wait-seconds 300 2>&1)
