@@ -2,7 +2,6 @@ name: Oracle ARM Auto-Provisioner
 
 on:
   schedule:
-    # Triggers every 2 hours as a backup scheduler
     - cron: '17 */2 * * *'
   workflow_dispatch:
 
@@ -13,7 +12,7 @@ concurrency:
 jobs:
   hunt-capacity:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # Max GitHub allowed limit (6 hours)
+    timeout-minutes: 340
 
     steps:
       - name: Set up Python
@@ -31,10 +30,14 @@ jobs:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_KEY_CONTENT: ${{ secrets.OCI_KEY_CONTENT }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           mkdir -p "$HOME/.oci"
           printf "%s\n" "$OCI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
           chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          # FIX: SSH key goes into a file (no more broken JSON from newlines)
+          printf "%s\n" "$SSH_PUBLIC_KEY" > "$HOME/ssh_key.pub"
 
           cat << EOF > "$HOME/.oci/config"
           [DEFAULT]
@@ -46,16 +49,15 @@ jobs:
           EOF
           chmod 600 "$HOME/.oci/config"
 
-          echo "🔍 Validating OCI Authentication..."
-          oci iam region-subscription list --query "data[0].\"region-name\"" --raw-output || echo "Auth check finished"
+          # FIX: if login is broken, STOP here with a red X instead of looping for 5 hours
+          echo "Checking OCI login..."
+          oci iam region-subscription list --query "data[0].\"region-name\"" --raw-output
+          echo "Login OK"
 
       - name: Check Existing Instance or Hunt Capacity
-        env:
-          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
         run: |
           set +e
 
-          TENANCY="ocid1.tenancy.oc1..aaaaaaaasp5nspa7btyxazrbxyikoy7dye64rdpn2m2e7ztb4uffag7iubia"
           COMPARTMENT="ocid1.tenancy.oc1..aaaaaaaasp5nspa7btyxazrbxyikoy7dye64rdpn2m2e7ztb4uffag7iubia"
           AD="WlOh:AP-HYDERABAD-1-AD-1"
           SHAPE="VM.Standard.A1.Flex"
@@ -63,40 +65,39 @@ jobs:
           SUBNET_ID="ocid1.subnet.oc1.ap-hyderabad-1.aaaaaaaae5l27ilikl2fkkls6p3pzz56igaz77jgnrowmrpmbrn6ieif4l4q"
           NAME="snookerops-prod"
 
-          # 1. Verify if instance was already created
-          EXISTING_STATE=$(oci compute instance list \
-            --compartment-id "$COMPARTMENT" \
-            --display-name "$NAME" \
-            --query "data[?\"lifecycle-state\"!='TERMINATED'] | [0].\"lifecycle-state\"" \
-            --raw-output 2>/dev/null)
+          # FIX: any instance that isn't TERMINATED counts (STOPPED too),
+          # so we never create a second one and go over the free limit
+          check_existing() {
+            oci compute instance list \
+              --compartment-id "$COMPARTMENT" \
+              --display-name "$NAME" \
+              --query "data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'] | [0].\"lifecycle-state\"" \
+              --raw-output 2>/dev/null
+          }
 
-          if [ "$EXISTING_STATE" = "RUNNING" ] || [ "$EXISTING_STATE" = "PROVISIONING" ] || [ "$EXISTING_STATE" = "STARTING" ]; then
-            echo "🎉 Instance $NAME is ALREADY ACTIVE (State: $EXISTING_STATE)!"
-            INSTANCE_ID=$(oci compute instance list --compartment-id "$COMPARTMENT" --display-name "$NAME" --query "data[0].id" --raw-output 2>/dev/null)
-            PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --query "data[0].\"public-ip\"" --raw-output 2>/dev/null || echo "Pending")
-            echo "🌐 Public IP: $PUBLIC_IP"
-            echo "SSH Connect: ssh -i ~/.ssh/oracle_snookerops_key ubuntu@$PUBLIC_IP"
-            exit 0
-          fi
-
-          echo "🚀 Starting 5-Hour Continuous Capacity Hunt in Hyderabad..."
           START_TIME=$(date +%s)
           ATTEMPT=0
 
           while true; do
-            ATTEMPT=$((ATTEMPT + 1))
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_TIME))
-
-            # Run for 300 minutes (5 hours) continuously before cleanly passing to the next cycle
-            if [ $ELAPSED -ge 18000 ]; then
-              echo "⏱️ 5-Hour hunt session complete (300 mins). Ready for next cycle."
+            # FIX: check before EVERY attempt, not just once at the start
+            STATE=$(check_existing)
+            if [ -n "$STATE" ] && [ "$STATE" != "null" ]; then
+              echo "Instance $NAME already exists (State: $STATE). Nothing to do."
+              echo "Get the public IP from the Oracle console: Compute > Instances."
               exit 0
             fi
 
-            TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-            echo "[$TIMESTAMP] Attempt #$ATTEMPT (Elapsed: $((ELAPSED / 60))m)..."
+            ATTEMPT=$((ATTEMPT + 1))
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+            if [ $ELAPSED -ge 18000 ]; then
+              echo "5-hour session done. Next scheduled run will continue."
+              exit 0
+            fi
 
+            echo "[$(date '+%H:%M:%S')] Attempt #$ATTEMPT (Elapsed: $((ELAPSED / 60))m)"
+
+            # FIX: no --wait-for-state. Waiting could time out AFTER Oracle accepted
+            # the request, and the old script would then launch a duplicate.
             RESULT=$(oci compute instance launch \
               --compartment-id "$COMPARTMENT" \
               --availability-domain "$AD" \
@@ -107,28 +108,27 @@ jobs:
               --subnet-id "$SUBNET_ID" \
               --assign-public-ip true \
               --boot-volume-size-in-gbs 100 \
-              --metadata "{\"ssh_authorized_keys\": \"$SSH_PUBLIC_KEY\"}" \
-              --wait-for-state RUNNING \
-              --max-wait-seconds 300 2>&1)
+              --ssh-authorized-keys-file "$HOME/ssh_key.pub" 2>&1)
 
-            if echo "$RESULT" | grep -q '"lifecycle-state": "RUNNING"'; then
-              echo ""
-              echo "🎉🎉🎉 SUCCESS! ARM INSTANCE PROVISIONED AND RUNNING! 🎉🎉🎉"
-              INSTANCE_ID=$(echo "$RESULT" | grep -o '"id": "[^"]*"' | head -1 | cut -d'"' -f4)
-              sleep 5
-              PUBLIC_IP=$(oci compute instance list-vnics --instance-id "$INSTANCE_ID" --query "data[0].\"public-ip\"" --raw-output 2>/dev/null || echo "")
-              echo "🌐 Public IP Address: $PUBLIC_IP"
-              echo "Connect using: ssh -i ~/.ssh/oracle_snookerops_key ubuntu@$PUBLIC_IP"
+            if echo "$RESULT" | grep -q '"lifecycle-state"'; then
+              echo "SUCCESS! Oracle accepted the request. Instance is being created."
+              echo "Check Compute > Instances in the Oracle console in 2-3 minutes for the public IP."
               exit 0
-            elif echo "$RESULT" | grep -qi "out of.*capacity\|out of host capacity\|InternalError\|LimitExceeded"; then
-              echo "   ⏳ Out of capacity in Hyderabad right now. Retrying in 45s..."
+            elif echo "$RESULT" | grep -qi "out of host capacity\|out of capacity"; then
+              echo "   Out of capacity. Retrying in 60s..."
+              sleep 60
             elif echo "$RESULT" | grep -qi "TooManyRequests"; then
-              echo "   ⚠️ Rate limited by Oracle. Waiting 75s..."
-              sleep 45
+              echo "   Rate limited. Waiting 120s..."
+              sleep 120
+            elif echo "$RESULT" | grep -qi "LimitExceeded"; then
+              # FIX: this is NOT a capacity problem. Stop and show it.
+              echo "LIMIT EXCEEDED - you already use your free A1 quota somewhere, or the account limit is 0."
+              echo "$RESULT"
+              exit 1
             else
-              echo "   ℹ️ OCI Output: $(echo "$RESULT" | grep -E '"message"|"code"' | head -4)"
-              echo "   Retrying in 45s..."
+              # FIX: show the FULL error so we can see what's really wrong
+              echo "   Unexpected error:"
+              echo "$RESULT" | head -20
+              sleep 60
             fi
-
-            sleep 45
           done
